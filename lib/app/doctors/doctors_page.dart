@@ -108,7 +108,9 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
   List<TimeSlot> _slots = [];
   bool _isLoading = true;
   String? _selectedDate;
-  TimeSlot? _selectedSlot;
+  String? _selectedTime;
+  List<String> _dbBookedSlots = [];
+  bool _isLoadingBooked = false;
   String _consultationType = 'online';
   final _complaintCtrl = TextEditingController();
 
@@ -118,6 +120,31 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
     _loadSlots();
   }
 
+  Future<void> _loadBookedSlots(String date) async {
+    setState(() {
+      _isLoadingBooked = true;
+      _dbBookedSlots = [];
+    });
+    try {
+      final api = ApiService();
+      final result = await api.get('/api/appointments/booked', queryParams: {
+        'doctorId': widget.doctor.id,
+        'date': date,
+      });
+      if (result['success'] == true && result['bookedSlots'] != null) {
+        setState(() {
+          _dbBookedSlots = List<String>.from(result['bookedSlots']);
+        });
+      }
+    } catch (e) {
+      debugPrint('Error loading booked slots: $e');
+    } finally {
+      setState(() {
+        _isLoadingBooked = false;
+      });
+    }
+  }
+
   Future<void> _loadSlots() async {
     final api = ApiService();
     final result = await api.get(ApiConfig.doctorTimeslotsById(widget.doctor.id));
@@ -125,7 +152,7 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
       setState(() {
         _slots = (result['timeslots'] as List)
             .map((t) => TimeSlot.fromJson(t))
-            .where((s) => s.isActive && !s.isBooked)
+            .where((s) => s.isActive)
             .toList();
         if (_slots.isNotEmpty) {
           final grouped = _groupSlotsByDate();
@@ -135,6 +162,9 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
         }
         _isLoading = false;
       });
+      if (_selectedDate != null) {
+        _loadBookedSlots(_selectedDate!);
+      }
     } else {
       // Try alternative endpoint
       final result2 = await api.get(ApiConfig.doctorTimeslots, queryParams: {'doctorId': widget.doctor.id});
@@ -142,7 +172,7 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
         setState(() {
           _slots = (result2['timeslots'] as List)
               .map((t) => TimeSlot.fromJson(t))
-              .where((s) => s.isActive && !s.isBooked)
+              .where((s) => s.isActive)
               .toList();
           if (_slots.isNotEmpty) {
             final grouped = _groupSlotsByDate();
@@ -152,6 +182,9 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
           }
           _isLoading = false;
         });
+        if (_selectedDate != null) {
+          _loadBookedSlots(_selectedDate!);
+        }
       } else {
         setState(() => _isLoading = false);
       }
@@ -165,6 +198,26 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
       map.putIfAbsent(date, () => []).add(s);
     }
     return map;
+  }
+
+  List<String> _generateTimeSlots(List<TimeSlot> activeBlocks, int duration) {
+    final Set<String> intervals = {};
+    for (final block in activeBlocks) {
+      String current = block.startTime;
+      while (current.compareTo(block.endTime) < 0) {
+        intervals.add(current);
+        final parts = current.split(':').map(int.parse).toList();
+        final h = parts[0];
+        final m = parts[1];
+        
+        final nextTime = DateTime(2000, 1, 1, h, m + duration);
+        final nextH = nextTime.hour.toString().padLeft(2, '0');
+        final nextM = nextTime.minute.toString().padLeft(2, '0');
+        current = '$nextH:$nextM';
+      }
+    }
+    final sorted = intervals.toList()..sort();
+    return sorted;
   }
 
   String _formatIndoDayDate(String dateStr) {
@@ -185,7 +238,6 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
     final doc = widget.doctor;
     final grouped = _groupSlotsByDate();
     final dates = grouped.keys.toList();
-    final activeSlots = _selectedDate != null ? (grouped[_selectedDate] ?? []) : [];
 
     return Scaffold(
       backgroundColor: AppTheme.surface,
@@ -293,59 +345,117 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
                 else if (dates.isEmpty)
                   Center(child: Padding(padding: const EdgeInsets.all(16), child: Text('Tidak ada jadwal tersedia', style: TextStyle(color: AppTheme.textMuted))))
                 else ...[
-                  // Date horizontal selector
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(
-                      children: dates.map((d) {
-                        final isSelected = _selectedDate == d;
-                        return Padding(
-                          padding: const EdgeInsets.only(right: 8),
-                          child: ChoiceChip(
-                            label: Text(_formatIndoDayDate(d), style: TextStyle(color: isSelected ? Colors.white : AppTheme.textSecondary, fontWeight: FontWeight.w600, fontSize: 12)),
-                            selected: isSelected,
-                            onSelected: (selected) {
-                              if (selected) {
-                                setState(() {
-                                  _selectedDate = d;
-                                  _selectedSlot = null;
-                                });
-                              }
-                            },
-                            selectedColor: AppTheme.primary,
-                            backgroundColor: Colors.white,
-                            side: BorderSide(color: isSelected ? AppTheme.primary : AppTheme.border),
-                          ),
-                        );
-                      }).toList(),
-                    ),
-                  ),
-                  const SizedBox(height: 20),
+                  // Date horizontal selector and dynamic timeslot grid
+                  Builder(
+                    builder: (context) {
+                      final app = context.watch<AppProvider>();
+                      final generatedTimes = _generateTimeSlots(
+                        _slots.where((s) {
+                          final slotDate = s.date.contains('T') ? s.date.split('T')[0] : s.date;
+                          return slotDate == _selectedDate && s.isActive;
+                        }).toList(),
+                        widget.doctor.consultationDuration,
+                      );
 
-                  const Text('Pilih Waktu', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
-                  const SizedBox(height: 10),
-                  if (activeSlots.isEmpty)
-                    Text('Tidak ada slot waktu untuk tanggal ini', style: TextStyle(color: AppTheme.textMuted, fontSize: 13))
-                  else
-                    Wrap(
-                      spacing: 10,
-                      runSpacing: 10,
-                      children: activeSlots.map((s) {
-                        final isSelected = _selectedSlot == s;
-                        return ChoiceChip(
-                          label: Text(s.startTime, style: TextStyle(color: isSelected ? Colors.white : AppTheme.textSecondary, fontWeight: FontWeight.w600)),
-                          selected: isSelected,
-                          onSelected: (selected) {
-                            setState(() {
-                              _selectedSlot = selected ? s : null;
-                            });
-                          },
-                          selectedColor: AppTheme.accent,
-                          backgroundColor: Colors.white,
-                          side: BorderSide(color: isSelected ? AppTheme.accent : AppTheme.border),
-                        );
-                      }).toList(),
-                    ),
+                      final localBooked = app.appointments
+                          .where((apt) {
+                            final aptDate = apt.date.contains('T') ? apt.date.split('T')[0] : apt.date;
+                            return apt.doctorId == doc.id &&
+                                aptDate == _selectedDate &&
+                                apt.status != 'cancelled';
+                          })
+                          .map((apt) => apt.time)
+                          .toList();
+                      final bookedTimes = {..._dbBookedSlots, ...localBooked};
+
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          SingleChildScrollView(
+                            scrollDirection: Axis.horizontal,
+                            child: Row(
+                              children: dates.map((d) {
+                                final isSelected = _selectedDate == d;
+                                return Padding(
+                                  padding: const EdgeInsets.only(right: 8),
+                                  child: ChoiceChip(
+                                    label: Text(_formatIndoDayDate(d), style: TextStyle(color: isSelected ? Colors.white : AppTheme.textSecondary, fontWeight: FontWeight.w600, fontSize: 12)),
+                                    selected: isSelected,
+                                    onSelected: (selected) {
+                                      if (selected) {
+                                        setState(() {
+                                          _selectedDate = d;
+                                          _selectedTime = null;
+                                        });
+                                        _loadBookedSlots(d);
+                                      }
+                                    },
+                                    selectedColor: AppTheme.primary,
+                                    backgroundColor: Colors.white,
+                                    side: BorderSide(color: isSelected ? AppTheme.primary : AppTheme.border),
+                                  ),
+                                );
+                              }).toList(),
+                            ),
+                          ),
+                          const SizedBox(height: 20),
+
+                          Row(
+                            children: [
+                              const Text('Pilih Waktu', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+                              if (_isLoadingBooked) ...[
+                                const SizedBox(width: 8),
+                                const SizedBox(
+                                  width: 14,
+                                  height: 14,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                ),
+                              ],
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          if (generatedTimes.isEmpty)
+                            Text('Tidak ada slot waktu untuk tanggal ini', style: TextStyle(color: AppTheme.textMuted, fontSize: 13))
+                          else
+                            Wrap(
+                              spacing: 10,
+                              runSpacing: 10,
+                              children: generatedTimes.map((time) {
+                                final isBooked = bookedTimes.contains(time);
+                                final isSelected = _selectedTime == time;
+                                return ChoiceChip(
+                                  label: Text(time, style: TextStyle(
+                                    color: isBooked
+                                        ? AppTheme.textMuted
+                                        : isSelected
+                                            ? Colors.white
+                                            : AppTheme.textSecondary,
+                                    fontWeight: FontWeight.w600,
+                                  )),
+                                  selected: isSelected,
+                                  onSelected: isBooked || _isLoadingBooked
+                                      ? null
+                                      : (selected) {
+                                          setState(() {
+                                            _selectedTime = selected ? time : null;
+                                          });
+                                        },
+                                  selectedColor: AppTheme.accent,
+                                  backgroundColor: isBooked ? AppTheme.surfaceDim : Colors.white,
+                                  side: BorderSide(
+                                    color: isBooked
+                                        ? AppTheme.border
+                                        : isSelected
+                                            ? AppTheme.accent
+                                            : AppTheme.border,
+                                  ),
+                                );
+                              }).toList(),
+                            ),
+                        ],
+                      );
+                    },
+                  ),
                 ],
               ],
             ),
@@ -383,9 +493,9 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
               elevation: 0,
             ),
-            onPressed: _selectedSlot == null ? null : _submitBooking,
+            onPressed: _selectedTime == null ? null : _submitBooking,
             child: Text(
-              _selectedSlot == null ? 'Pilih Jadwal & Waktu' : 'Konfirmasi - ${formatPrice(doc.price)}',
+              _selectedTime == null ? 'Pilih Jadwal & Waktu' : 'Konfirmasi - ${formatPrice(doc.price)}',
               style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
             ),
           ),
@@ -396,7 +506,7 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
   }
 
   Future<void> _submitBooking() async {
-    if (_selectedSlot == null || _selectedDate == null) return;
+    if (_selectedTime == null || _selectedDate == null) return;
     try {
       final auth = context.read<AuthProvider>();
       final app = context.read<AppProvider>();
@@ -408,7 +518,7 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
         'patientId': pp.id,
         'doctorId': widget.doctor.id,
         'date': _selectedDate!,
-        'time': _selectedSlot!.startTime,
+        'time': _selectedTime!,
         'type': _consultationType,
         'complaint': _complaintCtrl.text.trim(),
       });
